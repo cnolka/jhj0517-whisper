@@ -256,7 +256,30 @@ def transcribe(
                 language=language
             )
 
-            if decode_options["language"] == "ko":
+            language_codes_with_spaces = [
+                'en',  # English
+                'es',  # Spanish
+                'fr',  # French
+                'de',  # German
+                'it',  # Italian
+                'pt',  # Portuguese
+                'nl',  # Dutch
+                'sv',  # Swedish
+                'no',  # Norwegian
+                'da',  # Danish
+                'fi',  # Finnish
+                'hu',  # Hungarian
+                'ro',  # Romanian
+                'pl',  # Polish
+                'cs',  # Czech
+                'sk',  # Slovak
+                'sl',  # Slovenian
+                'ko',  # Korean
+                'tr',  # Turkish
+                'vi',  # Vietnamese
+            ]
+
+            if decode_options["language"] in language_codes_with_spaces:
                 result = remove_leading_spaces(result)
 
     return result

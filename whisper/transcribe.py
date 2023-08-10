@@ -10,7 +10,7 @@ import tqdm
 from .audio import SAMPLE_RATE, N_FRAMES, HOP_LENGTH, pad_or_trim, log_mel_spectrogram
 from .decoding import DecodingOptions, DecodingResult
 from .tokenizer import LANGUAGES, TO_LANGUAGE_CODE, get_tokenizer
-from .utils import exact_div, format_timestamp, make_safe, optional_int, optional_float, str2bool, get_writer
+from .utils import exact_div, format_timestamp, make_safe, optional_int, optional_float, str2bool, get_writer, remove_leading_spaces
 
 if TYPE_CHECKING:
     from .model import Whisper
@@ -250,11 +250,16 @@ def transcribe(
             pbar.update(min(num_frames, seek) - previous_seek_value)
             previous_seek_value = seek
 
-    return dict(
-        text=tokenizer.decode(all_tokens[len(initial_prompt_tokens):]),
-        segments=all_segments,
-        language=language
-    )
+            result = dict(
+                text=tokenizer.decode(all_tokens[len(initial_prompt_tokens):]),
+                segments=all_segments,
+                language=language
+            )
+
+            if decode_options["language"] == "ko":
+                result = remove_leading_spaces(result)
+
+    return result
 
 
 def cli():

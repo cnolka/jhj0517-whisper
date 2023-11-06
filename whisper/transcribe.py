@@ -43,8 +43,11 @@ def transcribe(
     compression_ratio_threshold: Optional[float] = 2.4,
     logprob_threshold: Optional[float] = -1.0,
     no_speech_threshold: Optional[float] = 0.6,
+    condition_on_previous_text: bool = True,
     initial_prompt: Optional[str] = None,
     word_timestamps: bool = False,
+    prepend_punctuations: str = "\"'“¿([{-",
+    append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
     progress_callback: Optional[Callable[[float], None]] = None,
     **decode_options,
 ):

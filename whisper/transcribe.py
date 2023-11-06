@@ -229,7 +229,7 @@ def transcribe(
         last_speech_timestamp = 0.0
         while seek < content_frames:
             if progress_callback is not None:
-                progress_value = seek / num_frames
+                progress_value = seek / content_frames
                 progress_callback(progress_value)
 
             time_offset = float(seek * HOP_LENGTH / SAMPLE_RATE)

@@ -2,7 +2,7 @@ import argparse
 import os
 import traceback
 import warnings
-from typing import TYPE_CHECKING, Optional, Tuple, Union, Callable
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union, Callable
 
 import numpy as np
 import torch
@@ -23,6 +23,7 @@ from .tokenizer import LANGUAGES, TO_LANGUAGE_CODE, get_tokenizer
 from .utils import (
     exact_div,
     format_timestamp,
+    get_end,
     get_writer,
     make_safe,
     optional_float,
@@ -48,6 +49,8 @@ def transcribe(
     word_timestamps: bool = False,
     prepend_punctuations: str = "\"'“¿([{-",
     append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
+    clip_timestamps: Union[str, List[float]] = "0",
+    hallucination_silence_threshold: Optional[float] = None,
     progress_callback: Optional[Callable[[float], None]] = None,
     **decode_options,
 ):
@@ -103,6 +106,14 @@ def transcribe(
     decode_options: dict
         Keyword arguments to construct `DecodingOptions` instances
 
+    clip_timestamps: Union[str, List[float]]
+        Comma-separated list start,end,start,end,... timestamps (in seconds) of clips to process.
+        The last end timestamp defaults to the end of the file.
+
+    hallucination_silence_threshold: Optional[float]
+        When word_timestamps is True, skip silent periods longer than this threshold (in seconds)
+        when a possible hallucination is detected
+
     Returns
     -------
     A dictionary containing the resulting text ("text") and segment-level details ("segments"), and
@@ -122,6 +133,7 @@ def transcribe(
     # Pad 30-seconds of silence to the input audio, for slicing
     mel = log_mel_spectrogram(audio, model.dims.n_mels, padding=N_SAMPLES)
     content_frames = mel.shape[-1] - N_FRAMES
+    content_duration = float(content_frames * HOP_LENGTH / SAMPLE_RATE)
 
     if decode_options.get("language", None) is None:
         if not model.is_multilingual:
@@ -148,6 +160,19 @@ def transcribe(
         task=task,
     )
 
+    if isinstance(clip_timestamps, str):
+        clip_timestamps = [
+            float(ts) for ts in (clip_timestamps.split(",") if clip_timestamps else [])
+        ]
+    seek_points: List[int] = [round(ts * FRAMES_PER_SECOND) for ts in clip_timestamps]
+    if len(seek_points) == 0:
+        seek_points.append(0)
+    if len(seek_points) % 2 == 1:
+        seek_points.append(content_frames)
+    seek_clips: List[Tuple[int, int]] = list(zip(seek_points[::2], seek_points[1::2]))
+
+    punctuation = "\"'“¿([{-\"'.。,，!！?？:：”)]}、"
+
     if word_timestamps and task == "translate":
         warnings.warn("Word-level timestamps on translations may not be reliable.")
 
@@ -172,18 +197,18 @@ def transcribe(
 
             needs_fallback = False
             if (
-                    compression_ratio_threshold is not None
-                    and decode_result.compression_ratio > compression_ratio_threshold
+                compression_ratio_threshold is not None
+                and decode_result.compression_ratio > compression_ratio_threshold
             ):
                 needs_fallback = True  # too repetitive
             if (
-                    logprob_threshold is not None
-                    and decode_result.avg_logprob < logprob_threshold
+                logprob_threshold is not None
+                and decode_result.avg_logprob < logprob_threshold
             ):
                 needs_fallback = True  # average log probability is too low
             if (
-                    no_speech_threshold is not None
-                    and decode_result.no_speech_prob > no_speech_threshold
+                no_speech_threshold is not None
+                and decode_result.no_speech_prob > no_speech_threshold
             ):
                 needs_fallback = False  # silence
             if not needs_fallback:
@@ -191,12 +216,13 @@ def transcribe(
 
         return decode_result
 
-    seek = 0
+    clip_idx = 0
+    seek = seek_clips[clip_idx][0]
     input_stride = exact_div(
         N_FRAMES, model.dims.n_audio_ctx
     )  # mel frames per output token: 2
     time_precision = (
-            input_stride * HOP_LENGTH / SAMPLE_RATE
+        input_stride * HOP_LENGTH / SAMPLE_RATE
     )  # time per output token: 0.02 (seconds)
     all_tokens = []
     all_segments = []
@@ -209,7 +235,7 @@ def transcribe(
         initial_prompt_tokens = []
 
     def new_segment(
-            *, start: float, end: float, tokens: torch.Tensor, result: DecodingResult
+        *, start: float, end: float, tokens: torch.Tensor, result: DecodingResult
     ):
         tokens = tokens.tolist()
         text_tokens = [token for token in tokens if token < tokenizer.eot]
@@ -227,19 +253,33 @@ def transcribe(
 
     # show the progress bar when verbose is False (if True, transcribed text will be printed)
     with tqdm.tqdm(
-            total=content_frames, unit="frames", disable=verbose is not False
+        total=content_frames, unit="frames", disable=verbose is not False
     ) as pbar:
         last_speech_timestamp = 0.0
-        while seek < content_frames:
+        # NOTE: This loop is obscurely flattened to make the diff readable.
+        # A later commit should turn this into a simpler nested loop.
+        # for seek_clip_start, seek_clip_end in seek_clips:
+        #     while seek < seek_clip_end
+        while clip_idx < len(seek_clips):
             if progress_callback is not None:
-                progress_value = seek / content_frames
+                progress_value = clip_idx / len(seek_clips)
                 progress_callback(progress_value)
 
+            seek_clip_start, seek_clip_end = seek_clips[clip_idx]
+            if seek < seek_clip_start:
+                seek = seek_clip_start
+            if seek >= seek_clip_end:
+                clip_idx += 1
+                if clip_idx < len(seek_clips):
+                    seek = seek_clips[clip_idx][0]
+                continue
             time_offset = float(seek * HOP_LENGTH / SAMPLE_RATE)
-            mel_segment = mel[:, seek: seek + N_FRAMES]
-            segment_size = min(N_FRAMES, content_frames - seek)
+            window_end_time = float((seek + N_FRAMES) * HOP_LENGTH / SAMPLE_RATE)
+            segment_size = min(N_FRAMES, content_frames - seek, seek_clip_end - seek)
+            mel_segment = mel[:, seek : seek + segment_size]
             segment_duration = segment_size * HOP_LENGTH / SAMPLE_RATE
             mel_segment = pad_or_trim(mel_segment, N_FRAMES).to(model.device).to(dtype)
+
             decode_options["prompt"] = all_tokens[prompt_reset_since:]
             result: DecodingResult = decode_with_fallback(mel_segment)
             tokens = torch.tensor(result.tokens)
@@ -248,8 +288,8 @@ def transcribe(
                 # no voice activity check
                 should_skip = result.no_speech_prob > no_speech_threshold
                 if (
-                        logprob_threshold is not None
-                        and result.avg_logprob > logprob_threshold
+                    logprob_threshold is not None
+                    and result.avg_logprob > logprob_threshold
                 ):
                     # don't skip if the logprob is high enough, despite the no_speech_prob
                     should_skip = False
@@ -260,6 +300,30 @@ def transcribe(
 
             previous_seek = seek
             current_segments = []
+
+            # anomalous words are very long/short/improbable
+            def word_anomaly_score(word: dict) -> float:
+                probability = word.get("probability", 0.0)
+                duration = word["end"] - word["start"]
+                score = 0.0
+                if probability < 0.15:
+                    score += 1.0
+                if duration < 0.133:
+                    score += (0.133 - duration) * 15
+                if duration > 2.0:
+                    score += duration - 2.0
+                return score
+
+            def is_segment_anomaly(segment: Optional[dict]) -> bool:
+                if segment is None or not segment["words"]:
+                    return False
+                words = [w for w in segment["words"] if w["word"] not in punctuation]
+                words = words[:8]
+                score = sum(word_anomaly_score(w) for w in words)
+                return score >= 3 or score + 0.01 >= len(words)
+
+            def next_words_segment(segments: List[dict]) -> Optional[dict]:
+                return next((s for s in segments if s["words"]), None)
 
             timestamp_tokens: torch.Tensor = tokens.ge(tokenizer.timestamp_begin)
             single_timestamp_ending = timestamp_tokens[-2:].tolist() == [False, True]
@@ -276,10 +340,10 @@ def transcribe(
                 for current_slice in slices:
                     sliced_tokens = tokens[last_slice:current_slice]
                     start_timestamp_pos = (
-                            sliced_tokens[0].item() - tokenizer.timestamp_begin
+                        sliced_tokens[0].item() - tokenizer.timestamp_begin
                     )
                     end_timestamp_pos = (
-                            sliced_tokens[-1].item() - tokenizer.timestamp_begin
+                        sliced_tokens[-1].item() - tokenizer.timestamp_begin
                     )
                     current_segments.append(
                         new_segment(
@@ -297,19 +361,19 @@ def transcribe(
                 else:
                     # otherwise, ignore the unfinished segment and seek to the last timestamp
                     last_timestamp_pos = (
-                            tokens[last_slice - 1].item() - tokenizer.timestamp_begin
+                        tokens[last_slice - 1].item() - tokenizer.timestamp_begin
                     )
                     seek += last_timestamp_pos * input_stride
             else:
                 duration = segment_duration
                 timestamps = tokens[timestamp_tokens.nonzero().flatten()]
                 if (
-                        len(timestamps) > 0
-                        and timestamps[-1].item() != tokenizer.timestamp_begin
+                    len(timestamps) > 0
+                    and timestamps[-1].item() != tokenizer.timestamp_begin
                 ):
                     # no consecutive timestamps but it has a timestamp; use the last one.
                     last_timestamp_pos = (
-                            timestamps[-1].item() - tokenizer.timestamp_begin
+                        timestamps[-1].item() - tokenizer.timestamp_begin
                     )
                     duration = last_timestamp_pos * time_precision
 
@@ -334,17 +398,71 @@ def transcribe(
                     append_punctuations=append_punctuations,
                     last_speech_timestamp=last_speech_timestamp,
                 )
-                word_end_timestamps = [
-                    w["end"] for s in current_segments for w in s["words"]
-                ]
-                if len(word_end_timestamps) > 0:
-                    last_speech_timestamp = word_end_timestamps[-1]
-                if not single_timestamp_ending and len(word_end_timestamps) > 0:
-                    seek_shift = round(
-                        (word_end_timestamps[-1] - time_offset) * FRAMES_PER_SECOND
-                    )
-                    if seek_shift > 0:
-                        seek = previous_seek + seek_shift
+
+                if not single_timestamp_ending:
+                    last_word_end = get_end(current_segments)
+                    if last_word_end is not None and last_word_end > time_offset:
+                        seek = round(last_word_end * FRAMES_PER_SECOND)
+
+                # skip silence before possible hallucinations
+                if hallucination_silence_threshold is not None:
+                    threshold = hallucination_silence_threshold
+                    if not single_timestamp_ending:
+                        last_word_end = get_end(current_segments)
+                        if last_word_end is not None and last_word_end > time_offset:
+                            remaining_duration = window_end_time - last_word_end
+                            if remaining_duration > threshold:
+                                seek = round(last_word_end * FRAMES_PER_SECOND)
+                            else:
+                                seek = previous_seek + segment_size
+
+                    # if first segment might be a hallucination, skip leading silence
+                    first_segment = next_words_segment(current_segments)
+                    if first_segment is not None and is_segment_anomaly(first_segment):
+                        gap = first_segment["start"] - time_offset
+                        if gap > threshold:
+                            seek = previous_seek + round(gap * FRAMES_PER_SECOND)
+                            continue
+
+                    # skip silence before any possible hallucination that is surrounded
+                    # by silence or more hallucinations
+                    hal_last_end = last_speech_timestamp
+                    for si in range(len(current_segments)):
+                        segment = current_segments[si]
+                        if not segment["words"]:
+                            continue
+                        if is_segment_anomaly(segment):
+                            next_segment = next_words_segment(
+                                current_segments[si + 1 :]
+                            )
+                            if next_segment is not None:
+                                hal_next_start = next_segment["words"][0]["start"]
+                            else:
+                                hal_next_start = time_offset + segment_duration
+                            silence_before = (
+                                segment["start"] - hal_last_end > threshold
+                                or segment["start"] < threshold
+                                or segment["start"] - time_offset < 2.0
+                            )
+                            silence_after = (
+                                hal_next_start - segment["end"] > threshold
+                                or is_segment_anomaly(next_segment)
+                                or window_end_time - segment["end"] < 2.0
+                            )
+                            if silence_before and silence_after:
+                                seek = round(
+                                    max(time_offset + 1, segment["start"])
+                                    * FRAMES_PER_SECOND
+                                )
+                                if content_duration - segment["end"] < threshold:
+                                    seek = content_frames
+                                current_segments[si:] = []
+                                break
+                        hal_last_end = segment["end"]
+
+                last_word_end = get_end(current_segments)
+                if last_word_end is not None:
+                    last_speech_timestamp = last_word_end
 
             if verbose:
                 for segment in current_segments:
@@ -363,8 +481,8 @@ def transcribe(
                 [
                     {"id": i, **segment}
                     for i, segment in enumerate(
-                    current_segments, start=len(all_segments)
-                )
+                        current_segments, start=len(all_segments)
+                    )
                 ]
             )
             all_tokens.extend(
@@ -377,8 +495,9 @@ def transcribe(
 
             # update progress bar
             pbar.update(min(content_frames, seek) - previous_seek)
+
     return dict(
-        text=tokenizer.decode(all_tokens[len(initial_prompt_tokens):]),
+        text=tokenizer.decode(all_tokens[len(initial_prompt_tokens) :]),
         segments=all_segments,
         language=language,
     )
@@ -398,66 +517,40 @@ def cli():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("audio", nargs="+", type=str, help="audio file(s) to transcribe")
     parser.add_argument("--model", default="small", type=valid_model_name, help="name of the Whisper model to use")
-    parser.add_argument("--model_dir", type=str, default=None,
-                        help="the path to save model files; uses ~/.cache/whisper by default")
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu",
-                        help="device to use for PyTorch inference")
+    parser.add_argument("--model_dir", type=str, default=None, help="the path to save model files; uses ~/.cache/whisper by default")
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="device to use for PyTorch inference")
     parser.add_argument("--output_dir", "-o", type=str, default=".", help="directory to save the outputs")
-    parser.add_argument("--output_format", "-f", type=str, default="all",
-                        choices=["txt", "vtt", "srt", "tsv", "json", "all"],
-                        help="format of the output file; if not specified, all available formats will be produced")
-    parser.add_argument("--verbose", type=str2bool, default=True,
-                        help="whether to print out the progress and debug messages")
+    parser.add_argument("--output_format", "-f", type=str, default="all", choices=["txt", "vtt", "srt", "tsv", "json", "all"], help="format of the output file; if not specified, all available formats will be produced")
+    parser.add_argument("--verbose", type=str2bool, default=True, help="whether to print out the progress and debug messages")
 
-    parser.add_argument("--task", type=str, default="transcribe", choices=["transcribe", "translate"],
-                        help="whether to perform X->X speech recognition ('transcribe') or X->English translation ('translate')")
-    parser.add_argument("--language", type=str, default=None,
-                        choices=sorted(LANGUAGES.keys()) + sorted([k.title() for k in TO_LANGUAGE_CODE.keys()]),
-                        help="language spoken in the audio, specify None to perform language detection")
+    parser.add_argument("--task", type=str, default="transcribe", choices=["transcribe", "translate"], help="whether to perform X->X speech recognition ('transcribe') or X->English translation ('translate')")
+    parser.add_argument("--language", type=str, default=None, choices=sorted(LANGUAGES.keys()) + sorted([k.title() for k in TO_LANGUAGE_CODE.keys()]), help="language spoken in the audio, specify None to perform language detection")
 
     parser.add_argument("--temperature", type=float, default=0, help="temperature to use for sampling")
-    parser.add_argument("--best_of", type=optional_int, default=5,
-                        help="number of candidates when sampling with non-zero temperature")
-    parser.add_argument("--beam_size", type=optional_int, default=5,
-                        help="number of beams in beam search, only applicable when temperature is zero")
-    parser.add_argument("--patience", type=float, default=None,
-                        help="optional patience value to use in beam decoding, as in https://arxiv.org/abs/2204.05424, the default (1.0) is equivalent to conventional beam search")
-    parser.add_argument("--length_penalty", type=float, default=None,
-                        help="optional token length penalty coefficient (alpha) as in https://arxiv.org/abs/1609.08144, uses simple length normalization by default")
+    parser.add_argument("--best_of", type=optional_int, default=5, help="number of candidates when sampling with non-zero temperature")
+    parser.add_argument("--beam_size", type=optional_int, default=5, help="number of beams in beam search, only applicable when temperature is zero")
+    parser.add_argument("--patience", type=float, default=None, help="optional patience value to use in beam decoding, as in https://arxiv.org/abs/2204.05424, the default (1.0) is equivalent to conventional beam search")
+    parser.add_argument("--length_penalty", type=float, default=None, help="optional token length penalty coefficient (alpha) as in https://arxiv.org/abs/1609.08144, uses simple length normalization by default")
 
-    parser.add_argument("--suppress_tokens", type=str, default="-1",
-                        help="comma-separated list of token ids to suppress during sampling; '-1' will suppress most special characters except common punctuations")
-    parser.add_argument("--initial_prompt", type=str, default=None,
-                        help="optional text to provide as a prompt for the first window.")
-    parser.add_argument("--condition_on_previous_text", type=str2bool, default=True,
-                        help="if True, provide the previous output of the model as a prompt for the next window; disabling may make the text inconsistent across windows, but the model becomes less prone to getting stuck in a failure loop")
-    parser.add_argument("--fp16", type=str2bool, default=True,
-                        help="whether to perform inference in fp16; True by default")
+    parser.add_argument("--suppress_tokens", type=str, default="-1", help="comma-separated list of token ids to suppress during sampling; '-1' will suppress most special characters except common punctuations")
+    parser.add_argument("--initial_prompt", type=str, default=None, help="optional text to provide as a prompt for the first window.")
+    parser.add_argument("--condition_on_previous_text", type=str2bool, default=True, help="if True, provide the previous output of the model as a prompt for the next window; disabling may make the text inconsistent across windows, but the model becomes less prone to getting stuck in a failure loop")
+    parser.add_argument("--fp16", type=str2bool, default=True, help="whether to perform inference in fp16; True by default")
 
-    parser.add_argument("--temperature_increment_on_fallback", type=optional_float, default=0.2,
-                        help="temperature to increase when falling back when the decoding fails to meet either of the thresholds below")
-    parser.add_argument("--compression_ratio_threshold", type=optional_float, default=2.4,
-                        help="if the gzip compression ratio is higher than this value, treat the decoding as failed")
-    parser.add_argument("--logprob_threshold", type=optional_float, default=-1.0,
-                        help="if the average log probability is lower than this value, treat the decoding as failed")
-    parser.add_argument("--no_speech_threshold", type=optional_float, default=0.6,
-                        help="if the probability of the <|nospeech|> token is higher than this value AND the decoding has failed due to `logprob_threshold`, consider the segment as silence")
-    parser.add_argument("--word_timestamps", type=str2bool, default=False,
-                        help="(experimental) extract word-level timestamps and refine the results based on them")
-    parser.add_argument("--prepend_punctuations", type=str, default="\"\'“¿([{-",
-                        help="if word_timestamps is True, merge these punctuation symbols with the next word")
-    parser.add_argument("--append_punctuations", type=str, default="\"\'.。,，!！?？:：”)]}、",
-                        help="if word_timestamps is True, merge these punctuation symbols with the previous word")
-    parser.add_argument("--highlight_words", type=str2bool, default=False,
-                        help="(requires --word_timestamps True) underline each word as it is spoken in srt and vtt")
-    parser.add_argument("--max_line_width", type=optional_int, default=None,
-                        help="(requires --word_timestamps True) the maximum number of characters in a line before breaking the line")
-    parser.add_argument("--max_line_count", type=optional_int, default=None,
-                        help="(requires --word_timestamps True) the maximum number of lines in a segment")
-    parser.add_argument("--max_words_per_line", type=optional_int, default=None,
-                        help="(requires --word_timestamps True, no effect with --max_line_width) the maximum number of words in a segment")
-    parser.add_argument("--threads", type=optional_int, default=0,
-                        help="number of threads used by torch for CPU inference; supercedes MKL_NUM_THREADS/OMP_NUM_THREADS")
+    parser.add_argument("--temperature_increment_on_fallback", type=optional_float, default=0.2, help="temperature to increase when falling back when the decoding fails to meet either of the thresholds below")
+    parser.add_argument("--compression_ratio_threshold", type=optional_float, default=2.4, help="if the gzip compression ratio is higher than this value, treat the decoding as failed")
+    parser.add_argument("--logprob_threshold", type=optional_float, default=-1.0, help="if the average log probability is lower than this value, treat the decoding as failed")
+    parser.add_argument("--no_speech_threshold", type=optional_float, default=0.6, help="if the probability of the <|nospeech|> token is higher than this value AND the decoding has failed due to `logprob_threshold`, consider the segment as silence")
+    parser.add_argument("--word_timestamps", type=str2bool, default=False, help="(experimental) extract word-level timestamps and refine the results based on them")
+    parser.add_argument("--prepend_punctuations", type=str, default="\"\'“¿([{-", help="if word_timestamps is True, merge these punctuation symbols with the next word")
+    parser.add_argument("--append_punctuations", type=str, default="\"\'.。,，!！?？:：”)]}、", help="if word_timestamps is True, merge these punctuation symbols with the previous word")
+    parser.add_argument("--highlight_words", type=str2bool, default=False, help="(requires --word_timestamps True) underline each word as it is spoken in srt and vtt")
+    parser.add_argument("--max_line_width", type=optional_int, default=None, help="(requires --word_timestamps True) the maximum number of characters in a line before breaking the line")
+    parser.add_argument("--max_line_count", type=optional_int, default=None, help="(requires --word_timestamps True) the maximum number of lines in a segment")
+    parser.add_argument("--max_words_per_line", type=optional_int, default=None, help="(requires --word_timestamps True, no effect with --max_line_width) the maximum number of words in a segment")
+    parser.add_argument("--threads", type=optional_int, default=0, help="number of threads used by torch for CPU inference; supercedes MKL_NUM_THREADS/OMP_NUM_THREADS")
+    parser.add_argument("--clip_timestamps", type=str, default="0", help="comma-separated list start,end,start,end,... timestamps (in seconds) of clips to process, where the last end timestamp defaults to the end of the file")
+    parser.add_argument("--hallucination_silence_threshold", type=optional_float, help="(requires --word_timestamps True) skip silent periods longer than this threshold (in seconds) when a possible hallucination is detected")
     # fmt: on
 
     args = parser.parse_args().__dict__

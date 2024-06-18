@@ -262,7 +262,7 @@ def transcribe(
         #     while seek < seek_clip_end
         while clip_idx < len(seek_clips):
             if progress_callback is not None:
-                progress_value = clip_idx / len(seek_clips)
+                progress_value = seek / len(seek_clips)
                 progress_callback(progress_value)
 
             seek_clip_start, seek_clip_end = seek_clips[clip_idx]

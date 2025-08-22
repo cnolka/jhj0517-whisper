@@ -1,4 +1,3 @@
-__version__ = "0.0.1"
 import platform
 import sys
 from pathlib import Path
@@ -6,11 +5,8 @@ from pathlib import Path
 import pkg_resources
 from setuptools import find_packages, setup
 
-
-def read_version(fname="whisper/version.py"):
-    exec(compile(open(fname, encoding="utf-8").read(), fname, "exec"))
-    return locals()["__version__"]
-
+# 直接使用固定版本号，避免 KeyError
+VERSION = "0.0.1"
 
 requirements = []
 if sys.platform.startswith("linux") and platform.machine() == "x86_64":
@@ -19,7 +15,7 @@ if sys.platform.startswith("linux") and platform.machine() == "x86_64":
 setup(
     name="openai-whisper",
     py_modules=["whisper"],
-    version=read_version(),
+    version=VERSION,  # 直接使用固定版本号
     description="Robust Speech Recognition via Large-Scale Weak Supervision",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
